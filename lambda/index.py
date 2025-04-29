@@ -1,112 +1,101 @@
 # lambda/index.py
 import json
 import os
-import boto3
-import re  # 正規表現モジュールをインポート
-from botocore.exceptions import ClientError
-
-
-# Lambda コンテキストからリージョンを抽出する関数
-def extract_region_from_arn(arn):
-    # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
-    match = re.search('arn:aws:lambda:([^:]+):', arn)
-    if match:
-        return match.group(1)
-    return "us-east-1"  # デフォルト値
-
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
-
-# モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+import urllib.request
+import urllib.error
+import traceback
 
 def lambda_handler(event, context):
+    api_endpoint_base = os.environ.get("NGROK_API_ENDPOINT")
+    
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
+        if not api_endpoint_base:
+            print("エラー: 環境変数 'NGROK_API_ENDPOINT' が設定されていません。")
+            raise ValueError("API エンドポイントが Lambda 環境変数に設定されていません。")
+            
+        api_url = f"{api_endpoint_base.rstrip('/')}/generate"
+        print(f"Target API URL: {api_url}")
+
         print("Received event:", json.dumps(event))
-        
-        # Cognitoで認証されたユーザー情報を取得
-        user_info = None
-        if 'requestContext' in event and 'authorizer' in event['requestContext']:
-            user_info = event['requestContext']['authorizer']['claims']
-            print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
-        
-        # リクエストボディの解析
-        body = json.loads(event['body'])
-        message = body['message']
-        conversation_history = body.get('conversationHistory', [])
-        
-        print("Processing message:", message)
-        print("Using model:", MODEL_ID)
-        
-        # 会話履歴を使用
+
+        try:
+            body = json.loads(event['body'])
+            message = body['message']
+            conversation_history = body.get('conversationHistory', [])
+            if not isinstance(message, str) or not message:
+                 raise ValueError("リクエストボディに有効な 'message' が含まれていません。")
+            if not isinstance(conversation_history, list):
+                 raise ValueError("'conversationHistory' はリスト形式である必要があります。")
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            print(f"リクエストボディの解析エラー: {e}")
+            raise ValueError(f"無効なリクエストボディです: {str(e)}") from e
+
+        print(f"Processing message: {message}")
+
+        request_data = {
+            "prompt": message,
+            "max_new_tokens": 512, 
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_p": 0.9
+        }
+        json_data = json.dumps(request_data).encode('utf-8')
+        print(f"Payload for FastAPI: {request_data}")
+
+        req = urllib.request.Request(
+            api_url,
+            data=json_data,
+            headers={'Content-Type': 'application/json', 'User-Agent': 'AWS-Lambda-Client/1.0'},
+            method='POST'
+        )
+
+        assistant_response = None
+
+        try:
+            print(f"Calling FastAPI: POST {api_url}")
+            with urllib.request.urlopen(req, timeout=30) as response:
+                status_code = response.getcode()
+                response_body_bytes = response.read()
+                response_body_str = response_body_bytes.decode('utf-8')
+                print(f"Received response: Status={status_code}, Body={response_body_str[:500]}...")
+
+                if status_code == 200:
+                    response_data = json.loads(response_body_str)
+                    assistant_response = response_data.get("generated_text") 
+                    if assistant_response is None:
+                         print("エラー: API応答に 'generated_text' が見つかりません。")
+                         raise ValueError("カスタムAPIからの応答形式が無効です")
+                    print(f"Extracted assistant response (first 100 chars): {assistant_response[:100]}...")
+                else:
+                    print(f"エラー: カスタムAPIがステータス {status_code} を返しました。 Body: {response_body_str}")
+                    raise urllib.error.HTTPError(api_url, status_code, f"API Error {status_code}", response.headers, response.fp)
+
+        except urllib.error.HTTPError as e:
+            error_body = "N/A"
+            try:
+                error_body = e.read().decode('utf-8')
+            except Exception:
+                pass
+            print(f"カスタムAPI呼び出し中のHTTPエラー: {e.code} - {error_body}")
+            raise Exception(f"モデルAPIとの通信エラーが発生しました (HTTP {e.code})。") from e
+        except urllib.error.URLError as e:
+            print(f"カスタムAPI呼び出し中のURLエラー: {e.reason}")
+            raise Exception(f"モデルAPIへの接続に失敗しました ({e.reason})。") from e
+        except json.JSONDecodeError:
+            print(f"API応答のJSONデコードエラー: {response_body_str}")
+            raise ValueError("モデルAPIからの応答を解析できませんでした。") from None
+
         messages = conversation_history.copy()
-        
-        # ユーザーメッセージを追加
         messages.append({
             "role": "user",
             "content": message
         })
-        
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
-        request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
-        }
-        
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
-        
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
-        )
-        
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
-        
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
         messages.append({
             "role": "assistant",
-            "content": assistant_response
+            "content": assistant_response 
         })
-        
-        # 成功レスポンスの返却
+
+        print("処理成功。応答を返します。")
         return {
             "statusCode": 200,
             "headers": {
@@ -121,10 +110,26 @@ def lambda_handler(event, context):
                 "conversationHistory": messages
             })
         }
-        
+
+    except ValueError as ve:
+        print(f"入力または形式のエラー: {ve}")
+        return {
+            "statusCode": 400, 
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods": "OPTIONS,POST"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": str(ve)
+            })
+        }
     except Exception as error:
-        print("Error:", str(error))
-        
+        print(f"Lambdaハンドラで予期せぬエラー発生: {error}")
+        traceback.print_exc()
+
         return {
             "statusCode": 500,
             "headers": {
@@ -135,6 +140,6 @@ def lambda_handler(event, context):
             },
             "body": json.dumps({
                 "success": False,
-                "error": str(error)
+                "error": "サーバー内部でエラーが発生しました。"
             })
         }
